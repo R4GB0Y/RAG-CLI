@@ -4,3 +4,7 @@
 __pycache__/
 *.pyc
 .venv/
+
+# Personal working notes — kept local, not published
+SPEC.md
+tasks/
