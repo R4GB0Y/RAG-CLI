@@ -20,12 +20,35 @@ incrementally rather than landing one giant, hard-to-review commit.
 """
 from __future__ import annotations
 
+import base64
 import hashlib
 from pathlib import Path
 
 import pymupdf  # PyMuPDF: one dependency for both text extraction and rendering
+from openai import OpenAI
 
 from src.config import load_config
+
+# Rendering resolution for pages sent to the vision model. 200 DPI is a
+# deliberate trade-off: high enough that small print (drug doses, mmHg values)
+# stays legible, low enough to keep the image — and the token cost of sending
+# it — modest. Lives here, not in .env, because it is an internal quality knob
+# of the OCR path, not a user-facing tunable.
+_OCR_RENDER_DPI = 200
+
+# The instruction we hand the vision model. Worded to fight the single biggest
+# risk of this whole pipeline: a model that *paraphrases* medical text instead
+# of transcribing it. We demand verbatim output, forbid summarising/translating,
+# and give it an explicit escape hatch ([illegible]) so it never invents text to
+# fill a gap it cannot read.
+_TRANSCRIBE_PROMPT = (
+    "You are a precise OCR engine. Transcribe ALL text visible in this image "
+    "exactly as it appears, verbatim. Preserve numbers, units, punctuation, "
+    "line breaks, and table structure as faithfully as plain text allows. Do "
+    "NOT summarise, translate, correct, reorder, or add anything. If part of "
+    "the image is unreadable, write [illegible] in its place. Output only the "
+    "transcribed text, with no preamble or commentary."
+)
 
 
 def _page_needs_ocr(
@@ -63,18 +86,54 @@ def _page_needs_ocr(
     return non_whitespace_count < min_chars
 
 
-def _transcribe_page_via_ocr(page: pymupdf.Page) -> str:
-    """Transcribe a single scanned page via a vision model — STUB (Task 3).
+def _transcribe_page_via_ocr(
+    page: pymupdf.Page,
+    client: OpenAI,
+    ocr_model: str,
+) -> str:
+    """Transcribe a single scanned page via a vision model.
 
-    Task 2 only routes pages here; the real implementation (render page to an
-    image, send it to `OCR_MODEL`, return the verbatim transcription) arrives in
-    Task 3. Raising loudly — rather than returning `""` — guarantees we never
-    silently drop the content of a page that genuinely needed OCR.
+    Three steps:
+      1. **Render** the PDF page to a raster image (PNG) with PyMuPDF — the same
+         library we use for native extraction, so no extra system dependency.
+         A vision model reads pixels, not a PDF, so we must rasterise first.
+      2. **Encode** those PNG bytes as a base64 `data:` URL. That inlines the
+         image directly in the request instead of hosting it somewhere and
+         passing a URL — simplest and keeps the page bytes off any third party
+         but OpenAI.
+      3. **Ask** `ocr_model` (a vision-capable chat model) to transcribe it
+         verbatim via `_TRANSCRIBE_PROMPT`, at `temperature=0` for the most
+         deterministic, least-creative output we can get.
+
+    The `client` and `ocr_model` are passed in (not built here) so the caller
+    creates the OpenAI client once and reuses it across every OCR'd page in a
+    document, rather than paying that setup cost per page.
     """
-    raise NotImplementedError(
-        "OCR fallback is implemented in Task 3. This page fell below "
-        "TEXT_LAYER_MIN_CHARS (or FORCE_OCR is set) and needs vision-based OCR."
+    # 1. Render page -> PNG bytes.
+    pixmap = page.get_pixmap(dpi=_OCR_RENDER_DPI)
+    png_bytes = pixmap.tobytes("png")
+
+    # 2. Inline the image as a base64 data URL.
+    base64_png = base64.b64encode(png_bytes).decode("ascii")
+    image_data_url = f"data:image/png;base64,{base64_png}"
+
+    # 3. Ask the vision model to transcribe it verbatim.
+    response = client.chat.completions.create(
+        model=ocr_model,
+        temperature=0,
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": _TRANSCRIBE_PROMPT},
+                    {"type": "image_url", "image_url": {"url": image_data_url}},
+                ],
+            }
+        ],
     )
+    # `.content` can be None if the model returns nothing usable; coerce to ""
+    # so the caller always gets a string and the per-file assembly never breaks.
+    return response.choices[0].message.content or ""
 
 
 def extract_text(pdf_path: str | Path) -> str:
@@ -107,12 +166,21 @@ def extract_text(pdf_path: str | Path) -> str:
 
     # Cache miss: open from the bytes we already read (avoids a second disk read)
     # and extract page by page.
+    #
+    # The OpenAI client is created lazily — only the first time a page actually
+    # needs OCR. A fully digital-native PDF therefore never constructs a client
+    # (and never needs a valid API key just to read its text layer).
     page_texts: list[str] = []
+    ocr_client: OpenAI | None = None
     with pymupdf.open(stream=raw_bytes, filetype="pdf") as document:
         for page in document:
             native_text = page.get_text()
             if _page_needs_ocr(native_text, config.force_ocr, config.text_layer_min_chars):
-                page_texts.append(_transcribe_page_via_ocr(page))
+                if ocr_client is None:
+                    ocr_client = OpenAI(api_key=config.openai_api_key)
+                page_texts.append(
+                    _transcribe_page_via_ocr(page, ocr_client, config.ocr_model)
+                )
             else:
                 page_texts.append(native_text)
 
