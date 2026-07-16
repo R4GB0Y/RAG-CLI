@@ -20,10 +20,11 @@ from src.config import load_config
 from src import vector_store
 
 # How many chunks to retrieve per question. Fixed retrieval breadth, not a
-# user-facing tunable (it isn't in the .env config surface). Three gives the
-# generator a little redundancy/context without drowning it in loosely-related
-# text. Promote to .env later if it ever needs tuning.
-_TOP_K = 3
+# user-facing tunable (it isn't in the .env config surface). Five gives the
+# generator enough of the (table-heavy, fragmented) corpus that the exact row a
+# question needs is more likely to be in-context, without drowning it in
+# loosely-related text. Promote to .env later if it ever needs tuning.
+_TOP_K = 5
 
 
 @dataclass

@@ -51,18 +51,35 @@ def render_answer(
     )
 
 
+# Spoken to the user whenever a question falls outside the knowledge base. It
+# stays in character (an emergency-triage assistant) and redirects, rather than
+# guessing — the refusal is still a refusal, just phrased as the persona.
+REFUSAL_MESSAGE = (
+    "Je suis une IA experte en urgences, ici pour vous assister dans le cadre "
+    "des urgences médicales. Je ne peux répondre qu'aux questions relevant de "
+    "ce domaine — n'hésitez pas à reformuler votre question dans ce contexte."
+)
+
+
 def render_refusal(score: float, console: Console | None = None) -> None:
-    """Render the 'I don't know' refusal, showing the near-miss score."""
+    """Render the out-of-scope refusal in the assistant's persona.
+
+    Still shows the near-miss score beneath the message so the tool remains
+    observable for threshold tuning — the persona is presentation, the score is
+    the diagnostic.
+    """
     console = console or _console
 
     body = Text()
-    body.append(
-        "I don't know — I couldn't find anything relevant to your question "
-        "in the knowledge base.\n\n"
-    )
+    body.append(REFUSAL_MESSAGE + "\n\n")
     body.append("Closest match score: ", style="bold")
     body.append(f"{score:.2f}")
 
     console.print(
-        Panel(body, title="I don't know", title_align="left", border_style="yellow")
+        Panel(
+            body,
+            title="Assistant Urgences",
+            title_align="left",
+            border_style="yellow",
+        )
     )
